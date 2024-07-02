@@ -28,6 +28,8 @@ class MlflowSpanExporter(SpanExporter):
 
     If we want to support distributed tracing, we should first implement an incremental trace
     logging in MLflow backend, then we can get rid of the in-memory trace aggregation.
+
+    :meta private:
     """
 
     def __init__(
@@ -44,7 +46,7 @@ class MlflowSpanExporter(SpanExporter):
         Export the spans to MLflow backend.
 
         Args:
-            spans: A sequence of OpenTelemetry ReadableSpan objects to be exported.
+            root_spans: A sequence of OpenTelemetry ReadableSpan objects to be exported.
                 Only root spans for each trace are passed to this method.
         """
         for span in root_spans:

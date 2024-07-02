@@ -9,7 +9,7 @@ import os
 import shutil
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import cloudpickle
 import yaml
@@ -19,9 +19,11 @@ import mlflow.utils
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model
 from mlflow.models.model import MLMODEL_FILE_NAME, MODEL_CODE_PATH
+from mlflow.models.rag_signatures import ChatCompletionRequest, SplitChatMessagesRequest
 from mlflow.models.signature import _extract_type_hints
 from mlflow.models.utils import _load_model_code_path
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
+from mlflow.pyfunc.utils.input_converter import _hydrate_dataclass
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.types.llm import ChatMessage, ChatParams, ChatResponse
 from mlflow.utils.annotations import experimental
@@ -242,6 +244,29 @@ class ChatModel(PythonModel, metaclass=ABCMeta):
             A :py:class:`ChatResponse <mlflow.types.llm.ChatResponse>` object containing
             the model's response(s), as well as other metadata.
         """
+
+    def predict_stream(
+        self, context, messages: List[ChatMessage], params: ChatParams
+    ) -> Iterator[ChatResponse]:
+        """
+        Evaluates a chat input and produces a chat output.
+        Overrides this function to implement a real stream prediction.
+        By default, this function just yields result of `predict` function.
+
+        Args:
+            messages (List[:py:class:`ChatMessage <mlflow.types.llm.ChatMessage>`]):
+                A list of :py:class:`ChatMessage <mlflow.types.llm.ChatMessage>`
+                objects representing chat history.
+            params (:py:class:`ChatParams <mlflow.types.llm.ChatParams>`):
+                A :py:class:`ChatParams <mlflow.types.llm.ChatParams>` object
+                containing various parameters used to modify model behavior during
+                inference.
+
+        Returns:
+            An iterator over :py:class:`ChatResponse <mlflow.types.llm.ChatResponse>` object
+            containing the model's response(s), as well as other metadata.
+        """
+        yield self.predict(context, messages, params)
 
 
 def _save_model_with_class_artifacts_params(
@@ -473,11 +498,15 @@ def _load_context_model_and_signature(
     pyfunc_config = _get_flavor_configuration(
         model_path=model_path, flavor_name=mlflow.pyfunc.FLAVOR_NAME
     )
+    signature = mlflow.models.Model.load(model_path).signature
 
     if MODEL_CODE_PATH in pyfunc_config:
         conf_model_code_path = pyfunc_config.get(MODEL_CODE_PATH)
         model_code_path = os.path.join(model_path, os.path.basename(conf_model_code_path))
         python_model = _load_model_code_path(model_code_path, model_config)
+
+        if callable(python_model):
+            python_model = _FunctionPythonModel(python_model, signature=signature)
     else:
         python_model_cloudpickle_version = pyfunc_config.get(CONFIG_KEY_CLOUDPICKLE_VERSION, None)
         if python_model_cloudpickle_version is None:
@@ -513,7 +542,6 @@ def _load_context_model_and_signature(
 
     context = PythonModelContext(artifacts=artifacts, model_config=model_config)
     python_model.load_context(context=context)
-    signature = mlflow.models.Model.load(model_path).signature
 
     return context, python_model, signature
 
@@ -580,7 +608,19 @@ class _PythonModelPyfuncWrapper:
             elif isinstance(model_input, list) and all(isinstance(x, dict) for x in model_input):
                 keys = [x.name for x in self.signature.inputs]
                 return [{k: d[k] for k in keys} for d in model_input]
-
+        elif isinstance(hints.input, type) and (
+            issubclass(hints.input, ChatCompletionRequest)
+            or issubclass(hints.input, SplitChatMessagesRequest)
+        ):
+            # If the type hint is a RAG dataclass, we hydrate it
+            if isinstance(model_input, pd.DataFrame):
+                # If there are multiple rows, we should throw
+                if len(model_input) > 1:
+                    raise MlflowException(
+                        "Expected a single input for dataclass type hint, but got multiple rows"
+                    )
+                # Since single input is expected, we take the first row
+                return _hydrate_dataclass(hints.input, model_input.iloc[0])
         return model_input
 
     def predict(self, model_input, params: Optional[Dict[str, Any]] = None):
